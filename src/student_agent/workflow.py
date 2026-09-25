@@ -610,9 +610,17 @@ def _classify_primary_issue(
     elif shipment.verdict == "logistics_delay":
         primary = "late_delivery_logistics"
     elif payment.verdict == "reconciled" and shipment.verdict == "on_time":
-        primary = "valid_split_payment" if len(payment.payment_references) > 1 else "insufficient_evidence"
-    else:
+        # Both domains reconcile cleanly - the claim isn't corroborated by any
+        # evidence gap, it's actively contradicted by the evidence found.
+        primary = "valid_split_payment" if len(payment.payment_references) > 1 else "unsupported_claim"
+    elif payment.verdict == "insufficient_evidence" or shipment.verdict == "insufficient_evidence":
+        # A domain genuinely has no usable evidence - can't conclude either way.
         primary = "insufficient_evidence"
+    else:
+        # Both domains produced a verdict, none of them a recognized problem
+        # (e.g. shipment "lost"/"returned" with reconciled payment) - the
+        # claim isn't supported by what was actually found.
+        primary = "unsupported_claim"
 
     if shipment.verdict in {"seller_delay", "logistics_delay"} and primary not in {
         "late_delivery_seller",
