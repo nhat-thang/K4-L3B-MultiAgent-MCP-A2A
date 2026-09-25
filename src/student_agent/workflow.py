@@ -491,7 +491,15 @@ async def _assess_payment(
             "dropped_payment_event_outside_order_purchase_window",
         )
 
-    captured_events = [event for event in events if event.get("event_type") == "captured"]
+    # Mirror the refund-side lesson: event_type names the kind of event,
+    # status carries the outcome. A "captured" event whose status is
+    # failed/declined/reversed never actually took money.
+    captured_events = [
+        event
+        for event in events
+        if event.get("event_type") == "captured"
+        and event.get("status") not in {"failed", "declined", "reversed", "voided"}
+    ]
     captured_total, duplicate_capture, kept_payments = _reconcile_captures(
         raw_payments, captured_events, events
     )
@@ -510,16 +518,25 @@ async def _assess_payment(
                 ["rejected_out_of_window"] * len(rejected_refund_events),
                 "dropped_refund_event_outside_order_purchase_window",
             )
-        completed = [e for e in refund_events if e.get("event_type") in {"completed", "refunded"}]
-        failed = [e for e in refund_events if e.get("event_type") == "failed"]
-        pending = [e for e in refund_events if e.get("event_type") in {"pending", "requested", "approved"}]
+        # event_type names the kind of event ("refund_requested", ...); the
+        # outcome lives in a separate "status" field (e.g. a "refund_requested"
+        # event can carry status="failed" for a declined request). Determine
+        # the current state from the most recent event's status rather than
+        # matching event_type against status-shaped strings.
+        FAILED_STATUSES = {"failed", "declined", "rejected"}
+        COMPLETED_STATUSES = {"completed", "confirmed", "refunded", "success", "succeeded"}
+        PENDING_STATUSES = {"pending", "open", "processing", "requested", "approved", "in_progress"}
+        completed = [e for e in refund_events if e.get("status") in COMPLETED_STATUSES]
         refunded_total = sum(_to_float(e.get("amount_brl")) for e in completed)
-        if completed:
-            refund_status = "completed"
-        elif failed:
-            refund_status = "failed"
-        elif pending:
-            refund_status = "pending"
+        if refund_events:
+            latest = max(refund_events, key=lambda e: e.get("event_at") or "")
+            latest_status = latest.get("status")
+            if latest_status in FAILED_STATUSES:
+                refund_status = "failed"
+            elif latest_status in COMPLETED_STATUSES:
+                refund_status = "completed"
+            elif latest_status in PENDING_STATUSES:
+                refund_status = "pending"
 
     # Compare against the order's own item+freight total (already time-window
     # filtered in the shipment agent), not the raw payment rows - those can
