@@ -327,6 +327,18 @@ async def _assess_shipment(
             ["rejected_out_of_window"] * len(rejected_limits),
             "dropped_shipping_limit_outside_order_purchase_window",
         )
+    # Same duplicate-row hazard as order_items: two shipping_limits rows for
+    # the same order_item_id can both survive the window filter. Without
+    # collapsing them, iterating every row below could flag a seller late
+    # based on a superseded limit even though the authoritative one was met.
+    limits, limits_dedup_rejected = _dedupe_by_key_closest(limits, "order_item_id", "shipping_limit_at", purchase)
+    if limits_dedup_rejected:
+        agent.record_conflict(
+            "shipment_summary.shipping_limits.duplicate_order_item_id",
+            "kept_closest_to_purchase",
+            [f"rejected@{row.get('shipping_limit_at')}" for row in limits_dedup_rejected],
+            "collapsed_duplicate_shipping_limit_to_closest_to_purchase",
+        )
 
     late_seller_ids: list[str] = []
     if delivered_carrier is not None:
