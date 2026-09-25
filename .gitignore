@@ -17,6 +17,7 @@ venv/
 htmlcov/
 
 # Competition runtime artifacts
+_backup_old_run/
 case-set.json
 inputs/*
 !inputs/.gitkeep

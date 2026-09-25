@@ -99,6 +99,39 @@ def _split_by_timeframe(
     return kept, rejected
 
 
+def _dedupe_by_key_closest(
+    rows: list[dict[str, Any]], key_field: str, date_field: str, anchor: datetime | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collapse rows that share the same key (e.g. two rows for the same
+    order_item_id) down to one.
+
+    The time-window filter only rejects rows far outside the order's
+    lifecycle; two conflicting versions of the same item can both legally
+    fall inside a 180-day window (e.g. a shipping_limit_date 3 days after
+    purchase and another 26 days after). Without this step both get summed
+    as if they were independent items, doubling the order's total. Keep
+    whichever row's date is closest to the purchase anchor - that's the one
+    still open/authoritative for this order's timeline.
+    """
+    if not rows:
+        return rows, []
+    best: dict[str, dict[str, Any]] = {}
+    best_diff: dict[str, float] = {}
+    rejected: list[dict[str, Any]] = []
+    for row in rows:
+        key = row.get(key_field)
+        dt = _parse_dt(row.get(date_field))
+        diff = abs((dt - anchor).total_seconds()) if dt and anchor else float("inf")
+        if key not in best or diff < best_diff[key]:
+            if key in best:
+                rejected.append(best[key])
+            best[key] = row
+            best_diff[key] = diff
+        else:
+            rejected.append(row)
+    return list(best.values()), rejected
+
+
 @dataclass
 class CaseAgent:
     """Collects evidence refs per MCP domain and mirrors them into the trace."""
@@ -259,6 +292,18 @@ async def _assess_shipment(
                 [f"rejected@{row.get('shipping_limit_date')}"],
                 "dropped_row_outside_order_purchase_window",
             )
+    # Two rows for the same order_item_id can both survive the window filter
+    # (e.g. shipping_limit_date 3 days vs 26 days after purchase, both inside
+    # a 180-day tolerance) - collapse to the one closest to purchase so the
+    # item isn't double-counted into order_item_total.
+    items, dedup_rejected = _dedupe_by_key_closest(items, "order_item_id", "shipping_limit_date", purchase)
+    if dedup_rejected:
+        agent.record_conflict(
+            "order_items.duplicate_order_item_id",
+            "kept_closest_to_purchase",
+            [f"rejected@{row.get('shipping_limit_date')}" for row in dedup_rejected],
+            "collapsed_duplicate_item_row_to_closest_to_purchase",
+        )
 
     item_ids = _cap_idset([row.get("order_item_id", "") for row in items])
     seller_ids = _cap_idset([row.get("seller_id", "") for row in items])
@@ -336,18 +381,22 @@ async def _assess_shipment(
 
 
 def _reconcile_captures(
-    raw_payments: list[dict[str, Any]], captured_events: list[dict[str, Any]]
+    raw_payments: list[dict[str, Any]],
+    captured_events: list[dict[str, Any]],
+    all_events: list[dict[str, Any]],
 ) -> tuple[float, bool, list[dict[str, Any]]]:
     """Reconcile payment rows against their captured events.
 
-    The same payment_sequential slot can appear more than once in the raw
-    rows for two different reasons that must be told apart:
+    The same payment_sequential slot can carry more than one amount in the
+    raw rows for three different reasons that must be told apart:
       - same amount repeated -> a genuine duplicate charge: both captures
         really took money, so they're summed.
-      - different amount -> a retried/corrected capture (e.g. an earlier
-        attempt flagged by a "reconciliation_mismatch" event, then captured
-        again later for the corrected amount): only the most recent capture
-        is real money: the earlier one was superseded, not additional.
+      - different amounts, one of them flagged by a non-"captured" event
+        (e.g. "reconciliation_mismatch") -> a retried/corrected capture:
+        only the most recent, unflagged capture is real money.
+      - different amounts, none flagged -> legitimate multi-part capture of
+        the same slot (e.g. freight captured on purchase day, price captured
+        weeks later) - both are real money, so they're summed too.
     Rows carry no timestamp of their own, so "most recent" is resolved via
     the event_at of the matching captured event (matched by amount, since
     events don't carry payment_sequential either).
@@ -369,6 +418,12 @@ def _reconcile_captures(
         if amount not in latest_event_at or event_at > latest_event_at[amount]:
             latest_event_at[amount] = event_at
 
+    flagged_amounts = {
+        round(_to_float(event.get("amount_brl")), 2)
+        for event in all_events
+        if event.get("event_type") != "captured"
+    }
+
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in kept_payments:
         sequential = row.get("payment_sequential")
@@ -382,12 +437,14 @@ def _reconcile_captures(
         if len(rows) > 1 and len(row_amounts) == 1:
             duplicate = True
             total += sum(_to_float(row.get("payment_value")) for row in rows)
-        else:
+        elif len(row_amounts) > 1 and row_amounts & flagged_amounts:
             latest_row = max(
                 rows,
                 key=lambda row: latest_event_at.get(round(_to_float(row.get("payment_value")), 2), ""),
             )
             total += _to_float(latest_row.get("payment_value"))
+        else:
+            total += sum(_to_float(row.get("payment_value")) for row in rows)
 
     return round(total, 2), duplicate, kept_payments
 
@@ -423,7 +480,9 @@ async def _assess_payment(
         )
 
     captured_events = [event for event in events if event.get("event_type") == "captured"]
-    captured_total, duplicate_capture, kept_payments = _reconcile_captures(raw_payments, captured_events)
+    captured_total, duplicate_capture, kept_payments = _reconcile_captures(
+        raw_payments, captured_events, events
+    )
 
     refund_evidence = await agent.fetch("get_refund_timeline", actor="payment-agent", order_id=order_id)
     refunded_total = 0.0
